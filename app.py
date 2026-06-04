@@ -2,9 +2,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import openpyxl
-import io, tempfile, os
+import io
 from datetime import date, timedelta, datetime
-from pyxlsb import open_workbook
 
 st.set_page_config(page_title="Equalização de Estoques", page_icon="📦", layout="wide")
 st.markdown("""
@@ -12,32 +11,18 @@ st.markdown("""
 [data-testid="stMetricValue"]{font-size:1.5rem;font-weight:600}
 [data-testid="stMetricLabel"]{font-size:.8rem;color:#666}
 .block-container{padding-top:1.5rem;padding-bottom:2rem}
-div[data-testid="stTabs"] button {font-size:.9rem}
+div[data-testid="stTabs"] button{font-size:.9rem}
 </style>""", unsafe_allow_html=True)
 
 # ── Leitura ───────────────────────────────────────────────────────────
-def save_tmp(b):
-    f = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsb")
-    f.write(b); f.close(); return f.name
-
 @st.cache_data(show_spinner=False)
 def get_sheets(b):
-    p = save_tmp(b)
-    try:
-        with open_workbook(p) as wb: return wb.sheets
-    finally: os.unlink(p)
+    wb = openpyxl.load_workbook(io.BytesIO(b), read_only=True, data_only=True)
+    names = wb.sheetnames; wb.close(); return names
 
 @st.cache_data(show_spinner=False)
 def read_sheet(b, sheet):
-    p = save_tmp(b)
-    rows = []
-    try:
-        with open_workbook(p) as wb:
-            with wb.get_sheet(sheet) as ws:
-                for row in ws.rows(): rows.append([c.v for c in row])
-    finally: os.unlink(p)
-    if not rows: return pd.DataFrame()
-    return pd.DataFrame(rows[1:], columns=rows[0])
+    return pd.read_excel(io.BytesIO(b), sheet_name=sheet, engine="openpyxl", dtype=str)
 
 def to_float(v):
     try:    return float(str(v).replace(",",".").strip())
@@ -49,10 +34,10 @@ def parse_date(v):
     if isinstance(v, date):     return v
     try:
         n = float(str(v).strip())
-        return (date(1899,12,30) + timedelta(days=int(n))) if n > 0 else None
+        return (date(1899,12,30)+timedelta(days=int(n))) if n>0 else None
     except: pass
     for fmt in ("%Y-%m-%d","%d/%m/%Y","%m/%Y"):
-        try: return datetime.strptime(str(v).strip()[:10], fmt).date()
+        try: return datetime.strptime(str(v).strip()[:10],fmt).date()
         except: pass
     return None
 
@@ -69,8 +54,8 @@ def processar(df_raw, linhas, pol_dias):
         if row["CMM"]>0:   return row["CMM"]*m,  False
         return 0.0, False
 
-    r90  = df.apply(lambda r: ideal(r,90),       axis=1)
-    ralt = df.apply(lambda r: ideal(r,pol_dias),  axis=1)
+    r90  = df.apply(lambda r: ideal(r,90),      axis=1)
+    ralt = df.apply(lambda r: ideal(r,pol_dias), axis=1)
     df["IDEAL_90"]     = r90.apply(lambda x: x[0])
     df["IDEAL_ALT"]    = ralt.apply(lambda x: x[0])
     df["ORIGEM_GRADE"] = r90.apply(lambda x: x[1])
@@ -103,15 +88,15 @@ def processar_lotes(df_raw, df_base):
     ]:
         for c in cands:
             if c in df.columns: df=df.rename(columns={c:dest}); break
-    df["COD_STR"]    = df["COD_STR"].astype(str).str.strip()
-    df["QUANTIDADE"] = df["QUANTIDADE"].apply(to_float)
-    df["VALIDADE_DT"]= df["VALIDADE_RAW"].apply(parse_date)
+    df["COD_STR"]     = df["COD_STR"].astype(str).str.strip()
+    df["QUANTIDADE"]  = df["QUANTIDADE"].apply(to_float)
+    df["VALIDADE_DT"] = df["VALIDADE_RAW"].apply(parse_date)
     skus = set(df_base["COD VALORES"].astype(str).str.strip())
     df = df[df["COD_STR"].isin(skus) & df["VALIDADE_DT"].notna()].copy()
     cmm_m  = df_base.groupby(df_base["COD VALORES"].astype(str).str.strip())["CMM_REDE"].first()
     desc_m = df_base.groupby(df_base["COD VALORES"].astype(str).str.strip())["DESCRICAO"].first()
     df["CMM_REDE"] = df["COD_STR"].map(cmm_m).fillna(0).apply(to_float)
-    df["DESCRICAO"] = df["COD_STR"].map(desc_m)
+    df["DESCRICAO"]= df["COD_STR"].map(desc_m)
     hoje = date.today()
     df["MAV"]   = df["VALIDADE_DT"].apply(lambda v: max(0,(v-hoje).days/30))
     df["MPC"]   = df.apply(lambda r: r["QUANTIDADE"]/r["CMM_REDE"] if r["CMM_REDE"]>0 else np.inf, axis=1)
@@ -131,9 +116,9 @@ def make_excel(df, df_lotes, pol_dias):
     from openpyxl.utils import get_column_letter
     thin = Side(style="thin", color="CCCCCC")
     brd  = Border(left=thin,right=thin,top=thin,bottom=thin)
-    CORES = {"TRANSFERIVEL":"D5F5E3","TRANSFERIVEL - GRADE":"A9DFBF",
-             "RETORNO_CD":"FADBD8","RETORNO_CD - GRADE":"F1948A",
-             "ADEQUADO":"EBF3FB","ADEQUADO - GRADE":"D6EAF8","SEM ESTOQUE":"F9F9F9"}
+    CORES={"TRANSFERIVEL":"D5F5E3","TRANSFERIVEL - GRADE":"A9DFBF",
+           "RETORNO_CD":"FADBD8","RETORNO_CD - GRADE":"F1948A",
+           "ADEQUADO":"EBF3FB","ADEQUADO - GRADE":"D6EAF8","SEM ESTOQUE":"F9F9F9"}
     def hdr(ws,r,c,v,bg="1F3864",fg="FFFFFF",sz=9,wrap=False):
         x=ws.cell(r,c,v); x.font=Font(bold=True,color=fg,size=sz,name="Arial")
         x.fill=PatternFill("solid",start_color=bg)
@@ -145,7 +130,8 @@ def make_excel(df, df_lotes, pol_dias):
         if fmt: x.number_format=fmt
         if bg:  x.fill=PatternFill("solid",start_color=bg)
         x.border=brd; return x
-    def W(ws,ws_): [ws.column_dimensions[get_column_letter(i+1)].set_width(w) for i,w in enumerate(ws_)] if hasattr(ws.column_dimensions[get_column_letter(1)],'set_width') else [setattr(ws.column_dimensions[get_column_letter(i+1)],'width',w) for i,w in enumerate(ws_)]
+    def W(ws,ws_):
+        for i,w in enumerate(ws_,1): ws.column_dimensions[get_column_letter(i)].width=w
     wb=Workbook(); hoje=date.today()
     # Resumo
     ws1=wb.active; ws1.title="1. Resumo"
@@ -154,21 +140,21 @@ def make_excel(df, df_lotes, pol_dias):
     kpis=[("Valor físico total",df["VALOR TOTAL "].sum(),"R$ #,##0.00"),
           ("Excesso 90d",df["VEX_90"].sum(),"R$ #,##0.00"),
           (f"Excesso {pol_dias}d",df["VEX_ALT"].sum(),"R$ #,##0.00"),
-          ("→ Transferível",df[df["CLF"].str.startswith("TRANSFERIVEL")]["VEX_90"].sum(),"R$ #,##0.00"),
-          ("→ Retorno ao CD",df[df["CLF"].str.startswith("RETORNO_CD")]["VEX_90"].sum(),"R$ #,##0.00"),
+          ("→ Transferível 90d",df[df["CLF"].str.startswith("TRANSFERIVEL")]["VEX_90"].sum(),"R$ #,##0.00"),
+          ("→ Retorno ao CD 90d",df[df["CLF"].str.startswith("RETORNO_CD")]["VEX_90"].sum(),"R$ #,##0.00"),
           ("Hospitais",df["HOSPITAL AJUSTADO"].nunique(),"#,##0"),
           ("SKUs",df["COD VALORES"].nunique(),"#,##0")]
     if df_lotes is not None:
-        kpis+=[("Lotes em risco",df_lotes[df_lotes["STATUS_VEN"]=="Vence antes de consumir"].shape[0],"#,##0")]
+        kpis.append(("Lotes em risco",df_lotes[df_lotes["STATUS_VEN"]=="Vence antes de consumir"].shape[0],"#,##0"))
     hdr(ws1,3,1,"Indicador",bg="2E75B6"); hdr(ws1,3,2,"Valor",bg="2E75B6")
     for i,(l,v,f) in enumerate(kpis,4):
         bg="EBF3FB" if i%2==0 else "FFFFFF"
         cel(ws1,i,1,l,bg=bg); cel(ws1,i,2,v,fmt=f,bg=bg,ha="right")
-    ws1.column_dimensions["A"].width=38; ws1.column_dimensions["B"].width=20
+    W(ws1,[38,20])
     # Transferências
     ws2=wb.create_sheet("2. Transferências 90d")
     hdr(ws2,1,1,"TRANSFERÊNCIAS — 90d",sz=11); ws2.merge_cells("A1:L1")
-    cols=["Regional","Hospital","Sigla","Cód. Produto","Descrição","Classif.","Origem",
+    cols=["Regional","Hospital","Sigla","Código","Descrição","Classificação","Origem",
           "Físico","Ideal 90d",f"Ideal {pol_dias}d","Excesso 90d","Valor Excesso 90d"]
     [hdr(ws2,2,j+1,h,bg="2E75B6",wrap=True) for j,h in enumerate(cols)]
     for i,(_,r) in enumerate(df[df["CLF"].str.startswith("TRANSFERIVEL")].sort_values("VEX_90",ascending=False).iterrows(),3):
@@ -178,12 +164,11 @@ def make_excel(df, df_lotes, pol_dias):
               r["FÍSICO"],r["IDEAL_90"],r["IDEAL_ALT"],r["EXCESSO_90"],r["VEX_90"]]
         fmts=[None,None,None,None,None,None,None,"#,##0.00","#,##0.00","#,##0.00","#,##0.00","R$ #,##0.00"]
         [cel(ws2,i,j+1,v,fmt=f,bg=bg,ha="right" if f else "left") for j,(v,f) in enumerate(zip(vals,fmts))]
-    [setattr(ws2.column_dimensions[get_column_letter(i+1)],'width',w) for i,w in enumerate([10,22,7,16,38,24,10,10,10,10,10,16])]
-    ws2.freeze_panes="A3"
+    W(ws2,[10,22,7,16,38,24,10,10,10,10,10,16]); ws2.freeze_panes="A3"
     # Retorno CD
     ws3=wb.create_sheet("3. Retorno ao CD")
     hdr(ws3,1,1,"RETORNO AO CD",sz=11); ws3.merge_cells("A1:K1")
-    cols3=["Regional","Hospital","Sigla","Cód. Produto","Descrição","Classif.","Origem",
+    cols3=["Regional","Hospital","Sigla","Código","Descrição","Classificação","Origem",
            "Físico","Excesso 90d","CMM Rede","Valor a Retornar"]
     [hdr(ws3,2,j+1,h,bg="C0392B",wrap=True) for j,h in enumerate(cols3)]
     for i,(_,r) in enumerate(df[df["CLF"].str.startswith("RETORNO_CD")].sort_values("VEX_90",ascending=False).iterrows(),3):
@@ -193,49 +178,31 @@ def make_excel(df, df_lotes, pol_dias):
               r["FÍSICO"],r["EXCESSO_90"],r["CMM_REDE"],r["VEX_90"]]
         fmts=[None,None,None,None,None,None,None,"#,##0.00","#,##0.00","#,##0.00","R$ #,##0.00"]
         [cel(ws3,i,j+1,v,fmt=f,bg=bg,ha="right" if f else "left") for j,(v,f) in enumerate(zip(vals,fmts))]
-    [setattr(ws3.column_dimensions[get_column_letter(i+1)],'width',w) for i,w in enumerate([10,22,7,16,38,24,10,10,10,10,16])]
-    ws3.freeze_panes="A3"
+    W(ws3,[10,22,7,16,38,24,10,10,10,10,16]); ws3.freeze_panes="A3"
     # Vencimento
     if df_lotes is not None:
         ws4=wb.create_sheet("4. Risco Vencimento")
-        hdr(ws4,1,1,"RISCO DE VENCIMENTO POR LOTE",sz=11); ws4.merge_panes("A1:L1") if hasattr(ws4,'merge_panes') else ws4.merge_cells("A1:L1")
-        cols4=["CD","Cód. Produto","Descrição","Lote","Validade","Meses até Vencer","Qtd. Lote","CMM Rede","Meses p/ Consumir","Saldo (meses)","Status"]
+        hdr(ws4,1,1,"RISCO DE VENCIMENTO POR LOTE",sz=11); ws4.merge_cells("A1:K1")
+        cols4=["CD","Código","Descrição","Lote","Validade","Meses até Vencer",
+               "Qtd. Lote","CMM Rede","Meses p/ Consumir","Saldo (meses)","Status"]
         [hdr(ws4,2,j+1,h,bg="922B21",wrap=True) for j,h in enumerate(cols4)]
         for i,(_,r) in enumerate(df_lotes[~df_lotes["STATUS_VEN"].str.startswith("OK")].sort_values(["STATUS_VEN","MAV"]).iterrows(),3):
             st=str(r["STATUS_VEN"]); bg="F1948A" if st=="Vence antes de consumir" else ("FAD7A0" if st=="Margem apertada" else "FDEDEC")
             mc=r["MPC"] if r["MPC"]!=np.inf else None; sd=r["SALDO"] if r["MPC"]!=np.inf else None
             vdt=datetime(r["VALIDADE_DT"].year,r["VALIDADE_DT"].month,r["VALIDADE_DT"].day) if r["VALIDADE_DT"] else None
-            vals=[r.get("FILIAL",""),r["COD_STR"],r.get("DESCRICAO",""),r.get("LOTE",""),vdt,r["MAV"],r["QUANTIDADE"],r["CMM_REDE"],mc,sd,st]
+            vals=[r.get("FILIAL",""),r["COD_STR"],r.get("DESCRICAO",""),r.get("LOTE",""),
+                  vdt,r["MAV"],r["QUANTIDADE"],r["CMM_REDE"],mc,sd,st]
             fmts=[None,None,None,None,"DD/MM/YYYY","#,##0.1","#,##0.00","#,##0.00","#,##0.1","#,##0.1",None]
             [cel(ws4,i,j+1,v,fmt=f,bg=bg,ha="right" if f else "left") for j,(v,f) in enumerate(zip(vals,fmts))]
-        [setattr(ws4.column_dimensions[get_column_letter(i+1)],'width',w) for i,w in enumerate([10,16,36,18,13,14,12,10,14,12,24])]
-        ws4.freeze_panes="A3"
+        W(ws4,[10,16,36,18,13,14,12,10,14,12,24]); ws4.freeze_panes="A3"
     buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
-
-# ── Gráficos (sem plotly — só matplotlib via st.bar_chart) ───────────
-def grafico_regional(df):
-    reg = df.groupby("REGIONAL").agg(
-        Físico=("VALOR TOTAL ","sum"),
-        Excesso_90d=("VEX_90","sum")
-    ).reset_index().sort_values("Excesso_90d",ascending=False)
-    reg = reg.set_index("REGIONAL")
-    st.bar_chart(reg[["Físico","Excesso_90d"]])
-
-def grafico_hospital(df):
-    hosp = df.groupby("HOSPITAL AJUSTADO").agg(
-        Físico=("VALOR TOTAL ","sum"),
-        Excesso_90d=("VEX_90","sum")
-    ).reset_index().sort_values("Excesso_90d",ascending=False).head(20)
-    hosp = hosp.set_index("HOSPITAL AJUSTADO")
-    st.bar_chart(hosp[["Físico","Excesso_90d"]])
 
 # ── Interface ─────────────────────────────────────────────────────────
 st.title("📦 Equalização de Estoques")
 
 with st.sidebar:
     st.header("⚙️ Configurações")
-    pol_dias = st.selectbox("Política alternativa", [120,150,180], index=1,
-                             help="90 dias é sempre calculado. Esta é a política adicional.")
+    pol_dias = st.selectbox("Política alternativa", [120,150,180], index=1)
     st.divider()
     st.markdown("**Legenda**")
     for clf,cor,desc in [
@@ -248,14 +215,15 @@ with st.sidebar:
         st.markdown(f'<span style="background:{cor};padding:2px 8px;border-radius:4px;font-size:.8rem">{clf}</span> {desc}',unsafe_allow_html=True)
 
 st.subheader("1. Upload da base")
-file_base = st.file_uploader("Arquivo de estudo (.xlsb)", type=["xlsb"])
+st.info("⚠️ O arquivo deve estar no formato **.xlsx** (Excel padrão). Para converter: abra o .xlsb no Excel → Salvar Como → Excel (.xlsx)", icon="ℹ️")
+file_base = st.file_uploader("Arquivo de estudo (.xlsx)", type=["xlsx"])
 
 if file_base:
     fb = file_base.read()
     with st.spinner("Lendo arquivo..."):
         sheets = get_sheets(fb)
     if "BASE_ESTUDOS" not in sheets:
-        st.error(f"Aba BASE_ESTUDOS não encontrada. Abas: {sheets}"); st.stop()
+        st.error(f"Aba BASE_ESTUDOS não encontrada. Abas disponíveis: {sheets}"); st.stop()
     with st.spinner("Carregando dados..."):
         df_raw = read_sheet(fb, "BASE_ESTUDOS")
 
@@ -274,99 +242,78 @@ if file_base:
     st.subheader("2. Base de lotes (opcional)")
     file_lotes = st.file_uploader("Lotes e validades (.xlsx ou .csv)", type=["xlsx","csv"])
     df_lotes = None
+    usar_cmv2 = False
     if file_lotes is None and "CMV_2" in sheets:
-        if st.checkbox("Usar aba CMV_2 do próprio arquivo", value=True):
-            file_lotes = "cmv2"
+        usar_cmv2 = st.checkbox("Usar aba CMV_2 do próprio arquivo", value=True)
 
     if st.button("▶ Rodar análise", type="primary", use_container_width=True):
         with st.spinner("Processando..."):
             df = processar(df_filtrado, linhas_sel, pol_dias)
-            if file_lotes == "cmv2":
+            if usar_cmv2:
                 df_lotes = processar_lotes(read_sheet(fb,"CMV_2"), df)
             elif file_lotes:
                 rl = pd.read_csv(file_lotes) if file_lotes.name.endswith(".csv") else pd.read_excel(file_lotes)
                 df_lotes = processar_lotes(rl, df)
-        st.session_state["df"]       = df
-        st.session_state["df_lotes"] = df_lotes
-        st.session_state["pol_dias"] = pol_dias
+        st.session_state.update({"df":df,"df_lotes":df_lotes,"pol_dias":pol_dias,"linhas_sel":linhas_sel})
 
 if "df" in st.session_state:
     df       = st.session_state["df"]
     df_lotes = st.session_state["df_lotes"]
     pol_dias = st.session_state["pol_dias"]
+    linhas_sel = st.session_state["linhas_sel"]
 
     st.divider()
-
-    # ── KPIs ──────────────────────────────────────────────────────────
     c1,c2,c3,c4 = st.columns(4)
-    c1.metric("💰 Valor físico",      f"R$ {df['VALOR TOTAL '].sum():,.0f}")
-    c2.metric("📉 Excesso 90d",       f"R$ {df['VEX_90'].sum():,.0f}",
-              delta=f"-R$ {df['VEX_90'].sum() - df['VEX_ALT'].sum():,.0f} em {pol_dias}d",
-              delta_color="inverse")
-    c3.metric("🔀 Transferível 90d",  f"R$ {df[df['CLF'].str.startswith('TRANSFERIVEL')]['VEX_90'].sum():,.0f}")
-    c4.metric("🏭 Retorno ao CD",     f"R$ {df[df['CLF'].str.startswith('RETORNO_CD')]['VEX_90'].sum():,.0f}")
+    c1.metric("💰 Valor físico",     f"R$ {df['VALOR TOTAL '].sum():,.0f}")
+    c2.metric("📉 Excesso 90d",      f"R$ {df['VEX_90'].sum():,.0f}",
+              delta=f"-R$ {df['VEX_90'].sum()-df['VEX_ALT'].sum():,.0f} em {pol_dias}d",delta_color="inverse")
+    c3.metric("🔀 Transferível 90d", f"R$ {df[df['CLF'].str.startswith('TRANSFERIVEL')]['VEX_90'].sum():,.0f}")
+    c4.metric("🏭 Retorno ao CD",    f"R$ {df[df['CLF'].str.startswith('RETORNO_CD')]['VEX_90'].sum():,.0f}")
 
     if df_lotes is not None:
         c5,c6,_,_ = st.columns(4)
-        n_risco = df_lotes[df_lotes["STATUS_VEN"]=="Vence antes de consumir"].shape[0]
-        s_risco = df_lotes[df_lotes["STATUS_VEN"]=="Vence antes de consumir"]["COD_STR"].nunique()
-        c5.metric("⚠️ Lotes em risco", f"{n_risco:,}")
-        c6.metric("🧬 SKUs em risco",  f"{s_risco:,}")
+        c5.metric("⚠️ Lotes em risco", df_lotes[df_lotes["STATUS_VEN"]=="Vence antes de consumir"].shape[0])
+        c6.metric("🧬 SKUs em risco",  df_lotes[df_lotes["STATUS_VEN"]=="Vence antes de consumir"]["COD_STR"].nunique())
 
     st.divider()
 
-    # ── Abas de análise ───────────────────────────────────────────────
-    tabs = ["📊 Por Regional", "🏥 Por Hospital", "🔀 Transferências", "🏭 Retorno ao CD"]
+    tabs = ["📊 Por Regional","🏥 Por Hospital","🔀 Transferências","🏭 Retorno ao CD"]
     if df_lotes is not None: tabs.append("⚠️ Risco de Vencimento")
     tabs.append("⬇️ Download Excel")
-
     tab_list = st.tabs(tabs)
-    t_reg, t_hosp, t_transf, t_ret = tab_list[0], tab_list[1], tab_list[2], tab_list[3]
-    t_ven  = tab_list[4] if df_lotes is not None else None
-    t_dl   = tab_list[-1]
+    t_reg,t_hosp,t_transf,t_ret = tab_list[0],tab_list[1],tab_list[2],tab_list[3]
+    t_ven = tab_list[4] if df_lotes is not None else None
+    t_dl  = tab_list[-1]
 
-    # ── Por Regional ──────────────────────────────────────────────────
     with t_reg:
         st.markdown("#### Excesso por regional")
         reg = df.groupby("REGIONAL").agg(
-            Físico=("VALOR TOTAL ","sum"),
-            Excesso_90d=("VEX_90","sum"),
-            Excesso_alt=("VEX_ALT","sum"),
-            Hospitais=("HOSPITAL AJUSTADO","nunique"),
-            SKUs=("COD VALORES","count"),
+            Físico=("VALOR TOTAL ","sum"), Excesso_90d=("VEX_90","sum"),
+            Excesso_alt=("VEX_ALT","sum"), Hospitais=("HOSPITAL AJUSTADO","nunique"),
+            SKUs=("COD VALORES","count")
         ).reset_index().sort_values("Excesso_90d",ascending=False)
         reg["%_Excesso"] = (reg["Excesso_90d"]/reg["Físico"]*100).round(1)
-
         st.bar_chart(reg.set_index("REGIONAL")[["Físico","Excesso_90d"]])
-
         reg_disp = reg.copy()
-        reg_disp["Físico"]       = reg_disp["Físico"].apply(lambda x: f"R$ {x:,.0f}")
-        reg_disp["Excesso_90d"]  = reg_disp["Excesso_90d"].apply(lambda x: f"R$ {x:,.0f}")
-        reg_disp["Excesso_alt"]  = reg_disp["Excesso_alt"].apply(lambda x: f"R$ {x:,.0f}")
-        reg_disp["%_Excesso"]    = reg_disp["%_Excesso"].apply(lambda x: f"{x:.1f}%")
+        reg_disp["Físico"]      = reg_disp["Físico"].apply(lambda x: f"R$ {x:,.0f}")
+        reg_disp["Excesso_90d"] = reg_disp["Excesso_90d"].apply(lambda x: f"R$ {x:,.0f}")
+        reg_disp["Excesso_alt"] = reg_disp["Excesso_alt"].apply(lambda x: f"R$ {x:,.0f}")
+        reg_disp["%_Excesso"]   = reg_disp["%_Excesso"].apply(lambda x: f"{x:.1f}%")
         reg_disp.columns = ["Regional","Valor Físico","Excesso 90d",f"Excesso {pol_dias}d","Hospitais","SKUs","% Excesso"]
         st.dataframe(reg_disp, use_container_width=True, hide_index=True)
-
-        # Classificação
         st.markdown("#### Distribuição por classificação")
-        clf_counts = df["CLF"].value_counts().reset_index()
-        clf_counts.columns=["Classificação","Itens"]
-        st.dataframe(clf_counts, use_container_width=True, hide_index=True)
+        st.dataframe(df["CLF"].value_counts().reset_index().rename(columns={"CLF":"Classificação","count":"Itens"}),
+                     use_container_width=True, hide_index=True)
 
-    # ── Por Hospital ──────────────────────────────────────────────────
     with t_hosp:
         st.markdown("#### Top 20 hospitais por excesso (90d)")
         hosp = df.groupby(["HOSPITAL AJUSTADO","SIGLA","REGIONAL"]).agg(
-            Físico=("VALOR TOTAL ","sum"),
-            Excesso_90d=("VEX_90","sum"),
-            Excesso_alt=("VEX_ALT","sum"),
-            SKUs=("COD VALORES","count"),
-            Sem_consumo=("CMM",lambda x:(x==0).sum()),
+            Físico=("VALOR TOTAL ","sum"), Excesso_90d=("VEX_90","sum"),
+            Excesso_alt=("VEX_ALT","sum"), SKUs=("COD VALORES","count"),
+            Sem_consumo=("CMM",lambda x:(x==0).sum())
         ).reset_index().sort_values("Excesso_90d",ascending=False)
         hosp["%_Excesso"] = (hosp["Excesso_90d"]/hosp["Físico"]*100).round(1)
-
         st.bar_chart(hosp.head(20).set_index("HOSPITAL AJUSTADO")[["Físico","Excesso_90d"]])
-
         hosp_disp = hosp.copy()
         hosp_disp["Físico"]      = hosp_disp["Físico"].apply(lambda x: f"R$ {x:,.0f}")
         hosp_disp["Excesso_90d"] = hosp_disp["Excesso_90d"].apply(lambda x: f"R$ {x:,.0f}")
@@ -376,107 +323,74 @@ if "df" in st.session_state:
                               f"Excesso {pol_dias}d","SKUs","Sem Consumo","% Excesso"]
         st.dataframe(hosp_disp, use_container_width=True, hide_index=True)
 
-    # ── Transferências ────────────────────────────────────────────────
     with t_transf:
         st.markdown("#### Itens para redistribuição entre hospitais")
-
-        col_f1, col_f2 = st.columns(2)
+        col_f1,col_f2 = st.columns(2)
         with col_f1:
-            regs_t = ["Todas"] + sorted(df["REGIONAL"].unique().tolist())
-            reg_f  = st.selectbox("Filtrar regional", regs_t, key="reg_transf")
+            reg_f = st.selectbox("Filtrar regional",["Todas"]+sorted(df["REGIONAL"].unique().tolist()),key="reg_transf")
         with col_f2:
-            tipo_f = st.selectbox("Tipo de excesso", ["Todos","Consumo real","Excesso de grade"], key="tipo_transf")
-
+            tipo_f = st.selectbox("Tipo de excesso",["Todos","Consumo real","Excesso de grade"],key="tipo_transf")
         transf = df[df["CLF"].str.startswith("TRANSFERIVEL")].copy()
-        if reg_f  != "Todas":         transf = transf[transf["REGIONAL"]==reg_f]
-        if tipo_f == "Consumo real":  transf = transf[transf["CLF"]=="TRANSFERIVEL"]
-        if tipo_f == "Excesso de grade": transf = transf[transf["CLF"]=="TRANSFERIVEL - GRADE"]
-
+        if reg_f!="Todas":           transf=transf[transf["REGIONAL"]==reg_f]
+        if tipo_f=="Consumo real":   transf=transf[transf["CLF"]=="TRANSFERIVEL"]
+        if tipo_f=="Excesso de grade": transf=transf[transf["CLF"]=="TRANSFERIVEL - GRADE"]
         transf_disp = transf[["REGIONAL","HOSPITAL AJUSTADO","SIGLA","COD VALORES","DESCRICAO",
                                "CLF","FÍSICO","IDEAL_90","EXCESSO_90","VALOR UNIT","VEX_90"]].copy()
-        transf_disp.columns = ["Regional","Hospital","Sigla","Código","Descrição",
-                                "Classificação","Físico","Ideal 90d","Excesso 90d","Valor Unit.","Valor Excesso"]
-        transf_disp = transf_disp.sort_values("Valor Excesso",ascending=False)
-
+        transf_disp.columns=["Regional","Hospital","Sigla","Código","Descrição",
+                              "Classificação","Físico","Ideal 90d","Excesso 90d","Valor Unit.","Valor Excesso"]
+        transf_disp=transf_disp.sort_values("Valor Excesso",ascending=False)
         st.caption(f"{len(transf_disp):,} itens  |  R$ {transf_disp['Valor Excesso'].sum():,.0f} em excesso")
-        st.dataframe(
-            transf_disp.style.format({
-                "Físico":"#,##0.00","Ideal 90d":"{:.2f}","Excesso 90d":"{:.2f}",
-                "Valor Unit.":"R$ {:,.2f}","Valor Excesso":"R$ {:,.2f}"
-            }),
-            use_container_width=True, hide_index=True, height=500
-        )
+        st.dataframe(transf_disp.style.format({
+            "Físico":"{:.2f}","Ideal 90d":"{:.2f}","Excesso 90d":"{:.2f}",
+            "Valor Unit.":"R$ {:,.2f}","Valor Excesso":"R$ {:,.2f}"}),
+            use_container_width=True, hide_index=True, height=500)
 
-    # ── Retorno ao CD ─────────────────────────────────────────────────
     with t_ret:
         st.markdown("#### Itens para retorno ao CD")
-
-        col_f3, col_f4 = st.columns(2)
+        col_f3,col_f4 = st.columns(2)
         with col_f3:
-            regs_r = ["Todas"] + sorted(df["REGIONAL"].unique().tolist())
-            reg_r  = st.selectbox("Filtrar regional", regs_r, key="reg_ret")
+            reg_r = st.selectbox("Filtrar regional",["Todas"]+sorted(df["REGIONAL"].unique().tolist()),key="reg_ret")
         with col_f4:
-            tipo_r = st.selectbox("Tipo", ["Todos","Sem consumo","Grade sem consumo"], key="tipo_ret")
-
+            tipo_r = st.selectbox("Tipo",["Todos","Sem consumo","Grade sem consumo"],key="tipo_ret")
         ret = df[df["CLF"].str.startswith("RETORNO_CD")].copy()
-        if reg_r != "Todas":             ret = ret[ret["REGIONAL"]==reg_r]
-        if tipo_r == "Sem consumo":      ret = ret[ret["CLF"]=="RETORNO_CD"]
-        if tipo_r == "Grade sem consumo":ret = ret[ret["CLF"]=="RETORNO_CD - GRADE"]
-
-        ret_disp = ret[["REGIONAL","HOSPITAL AJUSTADO","SIGLA","COD VALORES","DESCRICAO",
-                         "CLF","FÍSICO","IDEAL_90","EXCESSO_90","CMM_REDE","VALOR UNIT","VEX_90"]].copy()
-        ret_disp.columns = ["Regional","Hospital","Sigla","Código","Descrição",
-                             "Classificação","Físico","Ideal 90d","Excesso 90d","CMM Rede","Valor Unit.","Valor a Retornar"]
-        ret_disp = ret_disp.sort_values("Valor a Retornar",ascending=False)
-
+        if reg_r!="Todas":              ret=ret[ret["REGIONAL"]==reg_r]
+        if tipo_r=="Sem consumo":       ret=ret[ret["CLF"]=="RETORNO_CD"]
+        if tipo_r=="Grade sem consumo": ret=ret[ret["CLF"]=="RETORNO_CD - GRADE"]
+        ret_disp=ret[["REGIONAL","HOSPITAL AJUSTADO","SIGLA","COD VALORES","DESCRICAO",
+                       "CLF","FÍSICO","IDEAL_90","EXCESSO_90","CMM_REDE","VALOR UNIT","VEX_90"]].copy()
+        ret_disp.columns=["Regional","Hospital","Sigla","Código","Descrição",
+                           "Classificação","Físico","Ideal 90d","Excesso 90d","CMM Rede","Valor Unit.","Valor a Retornar"]
+        ret_disp=ret_disp.sort_values("Valor a Retornar",ascending=False)
         st.caption(f"{len(ret_disp):,} itens  |  R$ {ret_disp['Valor a Retornar'].sum():,.0f} a retornar")
-        st.dataframe(
-            ret_disp.style.format({
-                "Físico":"{:.2f}","Ideal 90d":"{:.2f}","Excesso 90d":"{:.2f}",
-                "CMM Rede":"{:.2f}","Valor Unit.":"R$ {:,.2f}","Valor a Retornar":"R$ {:,.2f}"
-            }),
-            use_container_width=True, hide_index=True, height=500
-        )
+        st.dataframe(ret_disp.style.format({
+            "Físico":"{:.2f}","Ideal 90d":"{:.2f}","Excesso 90d":"{:.2f}",
+            "CMM Rede":"{:.2f}","Valor Unit.":"R$ {:,.2f}","Valor a Retornar":"R$ {:,.2f}"}),
+            use_container_width=True, hide_index=True, height=500)
 
-    # ── Risco de Vencimento ───────────────────────────────────────────
     if t_ven is not None:
         with t_ven:
             st.markdown("#### Lotes com risco de vencer antes de ser consumidos")
-
-            status_opts = ["Todos com risco","Vence antes de consumir","Margem apertada","Sem consumo"]
-            status_f = st.selectbox("Filtrar status", status_opts, key="status_ven")
-
+            status_f = st.selectbox("Filtrar status",
+                ["Todos com risco","Vence antes de consumir","Margem apertada","Sem consumo"],key="status_ven")
             ven = df_lotes[~df_lotes["STATUS_VEN"].str.startswith("OK")].copy()
-            if status_f == "Vence antes de consumir": ven = ven[ven["STATUS_VEN"]=="Vence antes de consumir"]
-            elif status_f == "Margem apertada":        ven = ven[ven["STATUS_VEN"]=="Margem apertada"]
-            elif status_f == "Sem consumo":            ven = ven[ven["STATUS_VEN"].str.startswith("Sem consumo")]
-
-            # Resumo rápido
+            if status_f=="Vence antes de consumir": ven=ven[ven["STATUS_VEN"]=="Vence antes de consumir"]
+            elif status_f=="Margem apertada":        ven=ven[ven["STATUS_VEN"]=="Margem apertada"]
+            elif status_f=="Sem consumo":            ven=ven[ven["STATUS_VEN"].str.startswith("Sem consumo")]
             ca,cb,cc = st.columns(3)
-            ca.metric("Lotes em risco", ven[ven["STATUS_VEN"]=="Vence antes de consumir"].shape[0])
-            cb.metric("Margem apertada",ven[ven["STATUS_VEN"]=="Margem apertada"].shape[0])
-            cc.metric("Sem consumo",    ven[ven["STATUS_VEN"].str.startswith("Sem consumo")].shape[0])
+            ca.metric("Vence antes de consumir", ven[ven["STATUS_VEN"]=="Vence antes de consumir"].shape[0])
+            cb.metric("Margem apertada",          ven[ven["STATUS_VEN"]=="Margem apertada"].shape[0])
+            cc.metric("Sem consumo",              ven[ven["STATUS_VEN"].str.startswith("Sem consumo")].shape[0])
+            ven_disp = ven[["COD_STR","DESCRICAO","VALIDADE_DT","MAV","QUANTIDADE","CMM_REDE","SALDO","STATUS_VEN"]].copy()
+            ven_disp["MPC_txt"] = ven["MPC"].apply(lambda x: "∞" if x==np.inf else f"{x:.1f}")
+            ven_disp.columns=["Código","Descrição","Validade","Meses até Vencer","Qtd. Lote","CMM Rede","Saldo (meses)","Status","Meses p/ Consumir"]
+            st.dataframe(ven_disp.sort_values(["Status","Meses até Vencer"]),
+                         use_container_width=True, hide_index=True, height=500)
 
-            cols_ven = ["COD_STR","DESCRICAO","VALIDADE_DT","MAV","QUANTIDADE","CMM_REDE","MPC","SALDO","STATUS_VEN"]
-            ven_cols_existentes = [c for c in cols_ven if c in ven.columns]
-            ven_disp = ven[ven_cols_existentes].copy()
-            ven_disp = ven_disp.rename(columns={
-                "COD_STR":"Código","DESCRICAO":"Descrição","VALIDADE_DT":"Validade",
-                "MAV":"Meses até Vencer","QUANTIDADE":"Qtd. Lote","CMM_REDE":"CMM Rede",
-                "MPC":"Meses p/ Consumir","SALDO":"Saldo (meses)","STATUS_VEN":"Status"
-            })
-            ven_disp = ven_disp.sort_values(["Status","Meses até Vencer"])
-            ven_disp["MPC_disp"] = ven_disp.get("Meses p/ Consumir","").apply(
-                lambda x: "∞" if (isinstance(x,float) and np.isinf(x)) else f"{x:.1f}" if isinstance(x,(int,float)) else x)
-
-            st.dataframe(ven_disp, use_container_width=True, hide_index=True, height=500)
-
-    # ── Download ──────────────────────────────────────────────────────
     with t_dl:
         st.markdown("#### Download completo em Excel")
-        st.markdown("O arquivo contém todas as análises com formatação de cores e filtros.")
+        st.markdown("O arquivo contém todas as análises com formatação de cores.")
         buf  = make_excel(df, df_lotes, pol_dias)
-        nome = f"Equalizacao_{'_'.join(linhas_sel if 'linhas_sel' in dir() else ['base'])}_{date.today().strftime('%Y%m%d')}.xlsx"
+        nome = f"Equalizacao_{'_'.join(linhas_sel)}_{date.today().strftime('%Y%m%d')}.xlsx"
         st.download_button("⬇️ Baixar Excel", data=buf, file_name=nome,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True, type="primary")
