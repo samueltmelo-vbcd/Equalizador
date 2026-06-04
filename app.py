@@ -1,101 +1,111 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import xlsxwriter
-import io
-import tempfile
-import os
+import openpyxl
+import io, tempfile, os
 from datetime import date, timedelta, datetime
-from python_calamine import CalamineWorkbook
+from pyxlsb import open_workbook
 
 st.set_page_config(page_title="Equalização de Estoques", page_icon="📦", layout="wide")
 st.markdown("""
 <style>
-[data-testid="stMetricValue"]{font-size:1.4rem}
-.block-container{padding-top:2rem}
+[data-testid="stMetricValue"]{font-size:1.5rem;font-weight:600}
+[data-testid="stMetricLabel"]{font-size:.8rem;color:#666}
+.block-container{padding-top:1.5rem;padding-bottom:2rem}
+div[data-testid="stTabs"] button {font-size:.9rem}
 </style>""", unsafe_allow_html=True)
 
-# ── Leitura de arquivo ────────────────────────────────────────────────
-def save_tmp(b, suffix=".xlsb"):
-    f = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    f.write(b); f.close()
-    return f.name
+# ── Leitura ───────────────────────────────────────────────────────────
+def save_tmp(b):
+    f = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsb")
+    f.write(b); f.close(); return f.name
 
 @st.cache_data(show_spinner=False)
 def get_sheets(b):
     p = save_tmp(b)
-    try:    return CalamineWorkbook.from_path(p).sheet_names
+    try:
+        with open_workbook(p) as wb: return wb.sheets
     finally: os.unlink(p)
 
 @st.cache_data(show_spinner=False)
 def read_sheet(b, sheet):
     p = save_tmp(b)
-    try:    return pd.read_excel(p, sheet_name=sheet, engine="calamine", dtype=str)
+    rows = []
+    try:
+        with open_workbook(p) as wb:
+            with wb.get_sheet(sheet) as ws:
+                for row in ws.rows(): rows.append([c.v for c in row])
     finally: os.unlink(p)
+    if not rows: return pd.DataFrame()
+    return pd.DataFrame(rows[1:], columns=rows[0])
 
 def to_float(v):
-    try:    return float(str(v).replace(",", ".").strip())
+    try:    return float(str(v).replace(",",".").strip())
     except: return 0.0
 
 def parse_date(v):
     if v is None or (isinstance(v, str) and not v.strip()): return None
     if isinstance(v, datetime): return v.date()
     if isinstance(v, date):     return v
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d/%m/%Y", "%m/%Y"):
-        try:    return datetime.strptime(str(v).strip()[:len(fmt)], fmt).date()
+    try:
+        n = float(str(v).strip())
+        return (date(1899,12,30) + timedelta(days=int(n))) if n > 0 else None
+    except: pass
+    for fmt in ("%Y-%m-%d","%d/%m/%Y","%m/%Y"):
+        try: return datetime.strptime(str(v).strip()[:10], fmt).date()
         except: pass
     return None
 
 # ── Análise ───────────────────────────────────────────────────────────
 def processar(df_raw, linhas, pol_dias):
     df = df_raw[df_raw["LINHA"].isin(linhas) &
-                (df_raw["CONSIDERAR NO ESTUDO?"].str.strip() == "SIM")].copy()
+                (df_raw["CONSIDERAR NO ESTUDO?"].astype(str).str.strip()=="SIM")].copy()
     for c in ["FÍSICO","CMM","GRADE","VALOR UNIT","VALOR TOTAL "]:
         if c in df.columns: df[c] = df[c].apply(to_float)
 
     def ideal(row, d):
-        m = d / 30
-        if row["GRADE"] > 0:   return row["GRADE"], True
-        if row["CMM"]   > 0:   return row["CMM"] * m, False
+        m = d/30
+        if row["GRADE"]>0: return row["GRADE"], True
+        if row["CMM"]>0:   return row["CMM"]*m,  False
         return 0.0, False
 
-    r90  = df.apply(lambda r: ideal(r, 90),       axis=1)
-    ralt = df.apply(lambda r: ideal(r, pol_dias),  axis=1)
-    df["IDEAL_90"]       = r90.apply(lambda x: x[0])
-    df["IDEAL_ALT"]      = ralt.apply(lambda x: x[0])
-    df["ORIGEM_GRADE"]   = r90.apply(lambda x: x[1])
-    df["EXCESSO_90"]     = df["FÍSICO"] - df["IDEAL_90"]
-    df["EXCESSO_ALT"]    = df["FÍSICO"] - df["IDEAL_ALT"]
-    df["VEX_90"]         = df["EXCESSO_90"].clip(lower=0)  * df["VALOR UNIT"]
-    df["VEX_ALT"]        = df["EXCESSO_ALT"].clip(lower=0) * df["VALOR UNIT"]
+    r90  = df.apply(lambda r: ideal(r,90),       axis=1)
+    ralt = df.apply(lambda r: ideal(r,pol_dias),  axis=1)
+    df["IDEAL_90"]     = r90.apply(lambda x: x[0])
+    df["IDEAL_ALT"]    = ralt.apply(lambda x: x[0])
+    df["ORIGEM_GRADE"] = r90.apply(lambda x: x[1])
+    df["EXCESSO_90"]   = df["FÍSICO"] - df["IDEAL_90"]
+    df["EXCESSO_ALT"]  = df["FÍSICO"] - df["IDEAL_ALT"]
+    df["VEX_90"]       = df["EXCESSO_90"].clip(lower=0) * df["VALOR UNIT"]
+    df["VEX_ALT"]      = df["EXCESSO_ALT"].clip(lower=0)* df["VALOR UNIT"]
     cmm_r = df.groupby("COD VALORES")["CMM"].sum().rename("CMM_REDE")
     df = df.join(cmm_r, on="COD VALORES")
 
     def clf(row, exc):
-        if row["FÍSICO"] == 0:  return "SEM ESTOQUE"
+        if row["FÍSICO"]==0: return "SEM ESTOQUE"
         sfx = " - GRADE" if row["ORIGEM_GRADE"] else ""
-        if row[exc] <= 0:       return f"ADEQUADO/DEFICITARIO{sfx}"
-        if row["CMM_REDE"] > 0: return f"TRANSFERIVEL{sfx}"
+        if row[exc]<=0:        return f"ADEQUADO{sfx}"
+        if row["CMM_REDE"]>0:  return f"TRANSFERIVEL{sfx}"
         return f"RETORNO_CD{sfx}"
 
-    df["CLF"]     = df.apply(lambda r: clf(r, "EXCESSO_90"),  axis=1)
-    df["CLF_ALT"] = df.apply(lambda r: clf(r, "EXCESSO_ALT"), axis=1)
+    df["CLF"]     = df.apply(lambda r: clf(r,"EXCESSO_90"),  axis=1)
+    df["CLF_ALT"] = df.apply(lambda r: clf(r,"EXCESSO_ALT"), axis=1)
     return df
 
 def processar_lotes(df_raw, df_base):
     df = df_raw.copy()
-    for cands, dest in [
-        (["COD_PRODUTO","COD VALORES","Codigo do item","COD ARRUMAR"], "COD_STR"),
-        (["HOSPITAL","Filial","SIGLA"],                                 "FILIAL"),
-        (["LOTE","Lote fabricante","Lote interno"],                     "LOTE"),
-        (["VALIDADE","Validade","DATA_VALIDADE"],                       "VALIDADE_RAW"),
-        (["QUANTIDADE","Quantidade","QTDE","QTD"],                      "QUANTIDADE"),
+    for cands,dest in [
+        (["COD_PRODUTO","COD VALORES","Codigo do item","COD ARRUMAR"],"COD_STR"),
+        (["HOSPITAL","Filial","SIGLA"],"FILIAL"),
+        (["LOTE","Lote fabricante","Lote interno"],"LOTE"),
+        (["VALIDADE","Validade","DATA_VALIDADE"],"VALIDADE_RAW"),
+        (["QUANTIDADE","Quantidade","QTDE","QTD"],"QUANTIDADE"),
     ]:
         for c in cands:
-            if c in df.columns: df = df.rename(columns={c: dest}); break
-    df["COD_STR"]   = df["COD_STR"].astype(str).str.strip()
+            if c in df.columns: df=df.rename(columns={c:dest}); break
+    df["COD_STR"]    = df["COD_STR"].astype(str).str.strip()
     df["QUANTIDADE"] = df["QUANTIDADE"].apply(to_float)
-    df["VALIDADE_DT"] = df["VALIDADE_RAW"].apply(parse_date)
+    df["VALIDADE_DT"]= df["VALIDADE_RAW"].apply(parse_date)
     skus = set(df_base["COD VALORES"].astype(str).str.strip())
     df = df[df["COD_STR"].isin(skus) & df["VALIDADE_DT"].notna()].copy()
     cmm_m  = df_base.groupby(df_base["COD VALORES"].astype(str).str.strip())["CMM_REDE"].first()
@@ -103,326 +113,370 @@ def processar_lotes(df_raw, df_base):
     df["CMM_REDE"] = df["COD_STR"].map(cmm_m).fillna(0).apply(to_float)
     df["DESCRICAO"] = df["COD_STR"].map(desc_m)
     hoje = date.today()
-    df["MAV"] = df["VALIDADE_DT"].apply(lambda v: max(0,(v-hoje).days/30))
-    df["MPC"] = df.apply(lambda r: r["QUANTIDADE"]/r["CMM_REDE"] if r["CMM_REDE"]>0 else np.inf, axis=1)
+    df["MAV"]   = df["VALIDADE_DT"].apply(lambda v: max(0,(v-hoje).days/30))
+    df["MPC"]   = df.apply(lambda r: r["QUANTIDADE"]/r["CMM_REDE"] if r["CMM_REDE"]>0 else np.inf, axis=1)
     df["SALDO"] = df["MAV"] - df["MPC"]
     def sv(r):
-        if r["CMM_REDE"]==0:  return f"SEM CONSUMO — VENCE EM {r['MAV']:.0f}m"
-        if r["SALDO"]<0:      return "VENCE ANTES DE CONSUMIR"
-        if r["SALDO"]<=1:     return "MARGEM APERTADA"
+        if r["CMM_REDE"]==0: return f"Sem consumo — vence em {r['MAV']:.0f}m"
+        if r["SALDO"]<0:     return "Vence antes de consumir"
+        if r["SALDO"]<=1:    return "Margem apertada"
         return "OK"
     df["STATUS_VEN"] = df.apply(sv, axis=1)
     return df
 
-# ── Excel com xlsxwriter ──────────────────────────────────────────────
-CORES = {
-    "TRANSFERIVEL":                 "#D5F5E3",
-    "TRANSFERIVEL - GRADE":         "#A9DFBF",
-    "RETORNO_CD":                   "#FADBD8",
-    "RETORNO_CD - GRADE":           "#F1948A",
-    "ADEQUADO/DEFICITARIO":         "#EBF3FB",
-    "ADEQUADO/DEFICITARIO - GRADE": "#D6EAF8",
-    "SEM ESTOQUE":                  "#F9F9F9",
-}
-
+# ── Excel download ────────────────────────────────────────────────────
 def make_excel(df, df_lotes, pol_dias):
-    buf = io.BytesIO()
-    wb  = xlsxwriter.Workbook(buf, {"in_memory": True})
-
-    # formatos base
-    def F(**kw):
-        base = {"font_name":"Arial","font_size":9,"border":1,"valign":"vcenter"}
-        base.update(kw); return wb.add_format(base)
-
-    fH   = F(bold=True, bg_color="#1F3864", font_color="white", font_size=10, align="center", text_wrap=True)
-    fH2  = F(bold=True, bg_color="#2E75B6", font_color="white", font_size=9,  align="center", text_wrap=True)
-    fH3  = F(bold=True, bg_color="#C0392B", font_color="white", font_size=9,  align="center", text_wrap=True)
-    fH4  = F(bold=True, bg_color="#922B21", font_color="white", font_size=9,  align="center", text_wrap=True)
-    fH5  = F(bold=True, bg_color="#155A8A", font_color="white", font_size=9,  align="center", text_wrap=True)
-    fTxt = F(align="left")
-    fNum = F(align="right", num_format="#,##0.00")
-    fBRL = F(align="right", num_format='R$ #,##0.00')
-    fPct = F(align="right", num_format="0.0%")
-    fDat = F(align="center",num_format="dd/mm/yyyy")
-    fBld = F(bold=True, align="left")
-
-    def bg_txt(cor): return F(align="left",  bg_color=cor)
-    def bg_num(cor): return F(align="right", bg_color=cor, num_format="#,##0.00")
-    def bg_brl(cor): return F(align="right", bg_color=cor, num_format="R$ #,##0.00")
-    def bg_pct(cor): return F(align="right", bg_color=cor, num_format="0.0%")
-    def bg_dat(cor): return F(align="center",bg_color=cor, num_format="dd/mm/yyyy")
-
-    def write_row(ws, row, vals, fmts):
-        for col,(v,f) in enumerate(zip(vals,fmts)):
-            if isinstance(v, (datetime,)): ws.write_datetime(row, col, v, f)
-            elif isinstance(v, date):      ws.write_datetime(row, col, datetime(v.year,v.month,v.day), f)
-            elif v is None or (isinstance(v,float) and np.isnan(v)): ws.write_blank(row, col, None, f)
-            else: ws.write(row, col, v, f)
-
-    hoje = date.today()
-
-    # ── ABA 1: Resumo ─────────────────────────────────────────────────
-    ws1 = wb.add_worksheet("1. Resumo Executivo")
-    ws1.set_row(0, 28); ws1.set_row(1, 6)
-    ws1.merge_range(0,0,0,8, f"EQUALIZAÇÃO DE ESTOQUES  |  {hoje.strftime('%d/%m/%Y')}  |  Política alt.: {pol_dias}d", fH)
-
-    def kpi_bloco(col, dias_lbl, exc_col, clf_col):
-        ws1.write(2, col,   f"Indicador — {dias_lbl}", fH2)
-        ws1.write(2, col+1, "Valor",                   fH2)
-        kpis = [
-            ("Valor físico total",              df["VALOR TOTAL "].sum()),
-            (f"Excesso total ({dias_lbl})",     df[exc_col].sum()),
-            ("→ Transferível — consumo real",   df[df[clf_col]=="TRANSFERIVEL"][exc_col].sum()),
-            ("→ Transferível — grade",          df[df[clf_col]=="TRANSFERIVEL - GRADE"][exc_col].sum()),
-            ("→ Retorno CD — sem consumo",      df[df[clf_col]=="RETORNO_CD"][exc_col].sum()),
-            ("→ Retorno CD — grade s/ consumo", df[df[clf_col]=="RETORNO_CD - GRADE"][exc_col].sum()),
-            ("Hospitais analisados",            df["HOSPITAL AJUSTADO"].nunique()),
-            ("SKUs únicos",                     df["COD VALORES"].nunique()),
-        ]
-        if df_lotes is not None:
-            kpis += [
-                ("Lotes com risco de vencer", int(df_lotes[df_lotes["STATUS_VEN"]=="VENCE ANTES DE CONSUMIR"].shape[0])),
-                ("SKUs com risco de vencer",  int(df_lotes[df_lotes["STATUS_VEN"]=="VENCE ANTES DE CONSUMIR"]["COD_STR"].nunique())),
-            ]
-        ev="#EBF3FB"; od="#FFFFFF"
-        for i,(lbl,val) in enumerate(kpis):
-            bg = ev if i%2==0 else od
-            bold = "→" not in lbl
-            ws1.write(3+i, col,   lbl, F(align="left",  bg_color=bg, bold=bold))
-            ws1.write(3+i, col+1, val, F(align="right", bg_color=bg, bold=bold,
-                                          num_format="R$ #,##0.00" if isinstance(val,float) else "#,##0"))
-
-    kpi_bloco(0, "90d",       "VEX_90",  "CLF")
-    kpi_bloco(3, f"{pol_dias}d", "VEX_ALT", "CLF_ALT")
-
-    ws1.write(2,6,"Regional",fH2); ws1.write(2,7,"Excesso 90d",fH2); ws1.write(2,8,f"Excesso {pol_dias}d",fH2)
-    reg = df.groupby("REGIONAL").agg(E90=("VEX_90","sum"),EALT=("VEX_ALT","sum")).reset_index().sort_values("E90",ascending=False)
-    for i,(_,r) in enumerate(reg.iterrows()):
-        bg="#EBF3FB" if i%2==0 else "#FFFFFF"
-        ws1.write(3+i,6,r["REGIONAL"],bg_txt(bg))
-        ws1.write(3+i,7,r["E90"], bg_brl(bg))
-        ws1.write(3+i,8,r["EALT"],bg_brl(bg))
-
-    leg_row = 15
-    ws1.merge_range(leg_row,0,leg_row,8,"Legenda de classificações",fH2)
-    for j,(clf,cor,desc) in enumerate([
-        ("TRANSFERIVEL","#D5F5E3","Excesso real — consumo justifica; redirecionar para hospital com déficit"),
-        ("TRANSFERIVEL - GRADE","#A9DFBF","Excesso de grade — acima do contrato, sem consumo real"),
-        ("RETORNO_CD","#FADBD8","Sem consumo na rede — retornar ao CD para tratativa com fornecedor"),
-        ("RETORNO_CD - GRADE","#F1948A","Sem consumo nem grade — retornar com prioridade máxima"),
-        ("ADEQUADO/DEFICITARIO","#EBF3FB","Estoque dentro ou abaixo do ideal"),
-        ("ADEQUADO/DEFICITARIO - GRADE","#D6EAF8","Adequado conforme grade contratual"),
-    ]):
-        ws1.write(leg_row+1+j, 0, clf,  F(bold=True, bg_color=cor, align="left"))
-        ws1.merge_range(leg_row+1+j,1,leg_row+1+j,8, desc, F(bg_color="#FFFFFF", align="left"))
-
-    for i,w in enumerate([36,18,3,36,18,3,12,18,18]): ws1.set_column(i,i,w)
-    ws1.freeze_panes(3,0)
-
-    # ── Gerador de abas de transferência ─────────────────────────────
-    def aba_transf(name, clf_col, exc_col, exc_lbl, hdr_fmt):
-        ws = wb.add_worksheet(name)
-        ws.merge_range(0,0,0,13, name.split(". ",1)[1], fH)
-        cols=["Regional","Hospital","Sigla","Cód. Produto","Descrição","Classificação","Origem Ideal",
-              "Físico","Ideal 90d",f"Ideal {pol_dias}d","Excesso 90d",f"Excesso {pol_dias}d","Valor Unit.",exc_lbl]
-        for j,h in enumerate(cols): ws.write(1,j,h,hdr_fmt)
-        data=df[df[clf_col].str.startswith("TRANSFERIVEL")].sort_values(exc_col,ascending=False)
-        for i,(_,r) in enumerate(data.iterrows()):
-            bg=CORES.get(r[clf_col],"#FFFFFF")
-            orig="Grade" if r["ORIGEM_GRADE"] else "CMM (consumo)"
-            vals=[r["REGIONAL"],r["HOSPITAL AJUSTADO"],r["SIGLA"],str(r["COD VALORES"]),r["DESCRICAO"],
-                  r[clf_col],orig,r["FÍSICO"],r["IDEAL_90"],r["IDEAL_ALT"],
-                  r["EXCESSO_90"],r["EXCESSO_ALT"],r["VALOR UNIT"],r[exc_col]]
-            fmts=[bg_txt(bg),bg_txt(bg),bg_txt(bg),bg_txt(bg),bg_txt(bg),bg_txt(bg),bg_txt(bg),
-                  bg_num(bg),bg_num(bg),bg_num(bg),bg_num(bg),bg_num(bg),bg_brl(bg),bg_brl(bg)]
-            write_row(ws, 2+i, vals, fmts)
-        for i,w in enumerate([10,22,7,16,38,26,14,10,10,10,10,10,12,16]): ws.set_column(i,i,w)
-        ws.freeze_panes(2,0)
-
-    aba_transf("2. Transferências 90d",   "CLF",     "VEX_90",  "Valor Excesso 90d",    fH2)
-    aba_transf(f"3. Transferências {pol_dias}d","CLF_ALT","VEX_ALT",f"Valor Excesso {pol_dias}d",fH5)
-
-    # ── Aba 4: Retorno ao CD ──────────────────────────────────────────
-    ws4 = wb.add_worksheet("4. Retorno ao CD")
-    ws4.merge_range(0,0,0,14,"RETORNO AO CD  |  igual nas duas políticas — CMM zero na rede",fH)
-    cols4=["Regional","Hospital","Sigla","Cód. Produto","Descrição","Classificação","Origem Ideal",
-           "Físico","Ideal 90d",f"Ideal {pol_dias}d","Excesso 90d",f"Excesso {pol_dias}d","CMM Rede","Valor Unit.","Valor a Retornar"]
-    for j,h in enumerate(cols4): ws4.write(1,j,h,fH3)
-    retorno=df[df["CLF"].str.startswith("RETORNO_CD")].sort_values("VEX_90",ascending=False)
-    for i,(_,r) in enumerate(retorno.iterrows()):
-        bg=CORES.get(r["CLF"],"#FFFFFF")
-        orig="Grade" if r["ORIGEM_GRADE"] else "CMM (consumo)"
-        vals=[r["REGIONAL"],r["HOSPITAL AJUSTADO"],r["SIGLA"],str(r["COD VALORES"]),r["DESCRICAO"],
-              r["CLF"],orig,r["FÍSICO"],r["IDEAL_90"],r["IDEAL_ALT"],
-              r["EXCESSO_90"],r["EXCESSO_ALT"],r["CMM_REDE"],r["VALOR UNIT"],r["VEX_90"]]
-        fmts=[bg_txt(bg),bg_txt(bg),bg_txt(bg),bg_txt(bg),bg_txt(bg),bg_txt(bg),bg_txt(bg),
-              bg_num(bg),bg_num(bg),bg_num(bg),bg_num(bg),bg_num(bg),bg_num(bg),bg_brl(bg),bg_brl(bg)]
-        write_row(ws4, 2+i, vals, fmts)
-    for i,w in enumerate([10,22,7,16,38,26,14,10,10,10,10,10,10,12,16]): ws4.set_column(i,i,w)
-    ws4.freeze_panes(2,0)
-
-    # ── Aba 5: Vencimento ─────────────────────────────────────────────
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    thin = Side(style="thin", color="CCCCCC")
+    brd  = Border(left=thin,right=thin,top=thin,bottom=thin)
+    CORES = {"TRANSFERIVEL":"D5F5E3","TRANSFERIVEL - GRADE":"A9DFBF",
+             "RETORNO_CD":"FADBD8","RETORNO_CD - GRADE":"F1948A",
+             "ADEQUADO":"EBF3FB","ADEQUADO - GRADE":"D6EAF8","SEM ESTOQUE":"F9F9F9"}
+    def hdr(ws,r,c,v,bg="1F3864",fg="FFFFFF",sz=9,wrap=False):
+        x=ws.cell(r,c,v); x.font=Font(bold=True,color=fg,size=sz,name="Arial")
+        x.fill=PatternFill("solid",start_color=bg)
+        x.alignment=Alignment(horizontal="center",vertical="center",wrap_text=wrap)
+        x.border=brd
+    def cel(ws,r,c,v,fmt=None,bg=None,bold=False,ha="left"):
+        x=ws.cell(r,c,v); x.font=Font(bold=bold,color="000000",size=9,name="Arial")
+        x.alignment=Alignment(horizontal=ha,vertical="center")
+        if fmt: x.number_format=fmt
+        if bg:  x.fill=PatternFill("solid",start_color=bg)
+        x.border=brd; return x
+    def W(ws,ws_): [ws.column_dimensions[get_column_letter(i+1)].set_width(w) for i,w in enumerate(ws_)] if hasattr(ws.column_dimensions[get_column_letter(1)],'set_width') else [setattr(ws.column_dimensions[get_column_letter(i+1)],'width',w) for i,w in enumerate(ws_)]
+    wb=Workbook(); hoje=date.today()
+    # Resumo
+    ws1=wb.active; ws1.title="1. Resumo"
+    hdr(ws1,1,1,f"EQUALIZAÇÃO — {hoje.strftime('%d/%m/%Y')} — pol. alt.: {pol_dias}d",sz=11)
+    ws1.merge_cells("A1:F1")
+    kpis=[("Valor físico total",df["VALOR TOTAL "].sum(),"R$ #,##0.00"),
+          ("Excesso 90d",df["VEX_90"].sum(),"R$ #,##0.00"),
+          (f"Excesso {pol_dias}d",df["VEX_ALT"].sum(),"R$ #,##0.00"),
+          ("→ Transferível",df[df["CLF"].str.startswith("TRANSFERIVEL")]["VEX_90"].sum(),"R$ #,##0.00"),
+          ("→ Retorno ao CD",df[df["CLF"].str.startswith("RETORNO_CD")]["VEX_90"].sum(),"R$ #,##0.00"),
+          ("Hospitais",df["HOSPITAL AJUSTADO"].nunique(),"#,##0"),
+          ("SKUs",df["COD VALORES"].nunique(),"#,##0")]
     if df_lotes is not None:
-        ws5 = wb.add_worksheet("5. Risco de Vencimento")
-        ws5.merge_range(0,0,0,11,"ANÁLISE DE VENCIMENTO POR LOTE  |  risco = vence antes de consumir",fH)
-        cols5=["CD/Filial","Cód. Produto","Descrição","Lote","Validade","Dias até Vencer",
-               "Meses até Vencer","Qtd. Lote","CMM Rede","Meses p/ Consumir","Saldo (meses)","Status"]
-        for j,h in enumerate(cols5): ws5.write(1,j,h,fH4)
-        df_r=df_lotes[~df_lotes["STATUS_VEN"].str.startswith("OK")].sort_values(["STATUS_VEN","MAV"])
-        for i,(_,r) in enumerate(df_r.iterrows()):
-            st=str(r["STATUS_VEN"])
-            bg="#F1948A" if st=="VENCE ANTES DE CONSUMIR" else ("#FAD7A0" if st=="MARGEM APERTADA" else "#FDEDEC")
-            dias=(r["VALIDADE_DT"]-hoje).days if r["VALIDADE_DT"] else None
-            mc=r["MPC"]   if r["MPC"]!=np.inf else None
-            sd=r["SALDO"] if r["MPC"]!=np.inf else None
-            lote  = r.get("LOTE",   r.get("Lote fabricante",""))
-            filial= r.get("FILIAL", r.get("Filial",""))
-            vdt   = datetime(r["VALIDADE_DT"].year,r["VALIDADE_DT"].month,r["VALIDADE_DT"].day) if r["VALIDADE_DT"] else None
-            vals=[filial,r["COD_STR"],r.get("DESCRICAO",""),lote,vdt,dias,
-                  r["MAV"],r["QUANTIDADE"],r["CMM_REDE"],mc,sd,st]
-            fmts=[bg_txt(bg),bg_txt(bg),bg_txt(bg),bg_txt(bg),bg_dat(bg),
-                  F(align="right",bg_color=bg,num_format="#,##0"),
-                  bg_num(bg),bg_num(bg),bg_num(bg),bg_num(bg),bg_num(bg),
-                  F(bold=(st=="VENCE ANTES DE CONSUMIR"),align="left",bg_color=bg)]
-            write_row(ws5, 2+i, vals, fmts)
-        for i,w in enumerate([10,16,38,18,13,12,14,12,10,14,12,24]): ws5.set_column(i,i,w)
-        ws5.freeze_panes(2,0)
+        kpis+=[("Lotes em risco",df_lotes[df_lotes["STATUS_VEN"]=="Vence antes de consumir"].shape[0],"#,##0")]
+    hdr(ws1,3,1,"Indicador",bg="2E75B6"); hdr(ws1,3,2,"Valor",bg="2E75B6")
+    for i,(l,v,f) in enumerate(kpis,4):
+        bg="EBF3FB" if i%2==0 else "FFFFFF"
+        cel(ws1,i,1,l,bg=bg); cel(ws1,i,2,v,fmt=f,bg=bg,ha="right")
+    ws1.column_dimensions["A"].width=38; ws1.column_dimensions["B"].width=20
+    # Transferências
+    ws2=wb.create_sheet("2. Transferências 90d")
+    hdr(ws2,1,1,"TRANSFERÊNCIAS — 90d",sz=11); ws2.merge_cells("A1:L1")
+    cols=["Regional","Hospital","Sigla","Cód. Produto","Descrição","Classif.","Origem",
+          "Físico","Ideal 90d",f"Ideal {pol_dias}d","Excesso 90d","Valor Excesso 90d"]
+    [hdr(ws2,2,j+1,h,bg="2E75B6",wrap=True) for j,h in enumerate(cols)]
+    for i,(_,r) in enumerate(df[df["CLF"].str.startswith("TRANSFERIVEL")].sort_values("VEX_90",ascending=False).iterrows(),3):
+        bg=CORES.get(r["CLF"],"FFFFFF")
+        vals=[r["REGIONAL"],r["HOSPITAL AJUSTADO"],r["SIGLA"],str(r["COD VALORES"]),r["DESCRICAO"],
+              r["CLF"],"Grade" if r["ORIGEM_GRADE"] else "CMM",
+              r["FÍSICO"],r["IDEAL_90"],r["IDEAL_ALT"],r["EXCESSO_90"],r["VEX_90"]]
+        fmts=[None,None,None,None,None,None,None,"#,##0.00","#,##0.00","#,##0.00","#,##0.00","R$ #,##0.00"]
+        [cel(ws2,i,j+1,v,fmt=f,bg=bg,ha="right" if f else "left") for j,(v,f) in enumerate(zip(vals,fmts))]
+    [setattr(ws2.column_dimensions[get_column_letter(i+1)],'width',w) for i,w in enumerate([10,22,7,16,38,24,10,10,10,10,10,16])]
+    ws2.freeze_panes="A3"
+    # Retorno CD
+    ws3=wb.create_sheet("3. Retorno ao CD")
+    hdr(ws3,1,1,"RETORNO AO CD",sz=11); ws3.merge_cells("A1:K1")
+    cols3=["Regional","Hospital","Sigla","Cód. Produto","Descrição","Classif.","Origem",
+           "Físico","Excesso 90d","CMM Rede","Valor a Retornar"]
+    [hdr(ws3,2,j+1,h,bg="C0392B",wrap=True) for j,h in enumerate(cols3)]
+    for i,(_,r) in enumerate(df[df["CLF"].str.startswith("RETORNO_CD")].sort_values("VEX_90",ascending=False).iterrows(),3):
+        bg=CORES.get(r["CLF"],"FFFFFF")
+        vals=[r["REGIONAL"],r["HOSPITAL AJUSTADO"],r["SIGLA"],str(r["COD VALORES"]),r["DESCRICAO"],
+              r["CLF"],"Grade" if r["ORIGEM_GRADE"] else "CMM",
+              r["FÍSICO"],r["EXCESSO_90"],r["CMM_REDE"],r["VEX_90"]]
+        fmts=[None,None,None,None,None,None,None,"#,##0.00","#,##0.00","#,##0.00","R$ #,##0.00"]
+        [cel(ws3,i,j+1,v,fmt=f,bg=bg,ha="right" if f else "left") for j,(v,f) in enumerate(zip(vals,fmts))]
+    [setattr(ws3.column_dimensions[get_column_letter(i+1)],'width',w) for i,w in enumerate([10,22,7,16,38,24,10,10,10,10,16])]
+    ws3.freeze_panes="A3"
+    # Vencimento
+    if df_lotes is not None:
+        ws4=wb.create_sheet("4. Risco Vencimento")
+        hdr(ws4,1,1,"RISCO DE VENCIMENTO POR LOTE",sz=11); ws4.merge_panes("A1:L1") if hasattr(ws4,'merge_panes') else ws4.merge_cells("A1:L1")
+        cols4=["CD","Cód. Produto","Descrição","Lote","Validade","Meses até Vencer","Qtd. Lote","CMM Rede","Meses p/ Consumir","Saldo (meses)","Status"]
+        [hdr(ws4,2,j+1,h,bg="922B21",wrap=True) for j,h in enumerate(cols4)]
+        for i,(_,r) in enumerate(df_lotes[~df_lotes["STATUS_VEN"].str.startswith("OK")].sort_values(["STATUS_VEN","MAV"]).iterrows(),3):
+            st=str(r["STATUS_VEN"]); bg="F1948A" if st=="Vence antes de consumir" else ("FAD7A0" if st=="Margem apertada" else "FDEDEC")
+            mc=r["MPC"] if r["MPC"]!=np.inf else None; sd=r["SALDO"] if r["MPC"]!=np.inf else None
+            vdt=datetime(r["VALIDADE_DT"].year,r["VALIDADE_DT"].month,r["VALIDADE_DT"].day) if r["VALIDADE_DT"] else None
+            vals=[r.get("FILIAL",""),r["COD_STR"],r.get("DESCRICAO",""),r.get("LOTE",""),vdt,r["MAV"],r["QUANTIDADE"],r["CMM_REDE"],mc,sd,st]
+            fmts=[None,None,None,None,"DD/MM/YYYY","#,##0.1","#,##0.00","#,##0.00","#,##0.1","#,##0.1",None]
+            [cel(ws4,i,j+1,v,fmt=f,bg=bg,ha="right" if f else "left") for j,(v,f) in enumerate(zip(vals,fmts))]
+        [setattr(ws4.column_dimensions[get_column_letter(i+1)],'width',w) for i,w in enumerate([10,16,36,18,13,14,12,10,14,12,24])]
+        ws4.freeze_panes="A3"
+    buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
 
-    # ── Aba 6: Por Hospital ───────────────────────────────────────────
-    ws6=wb.add_worksheet("6. Por Hospital")
-    ws6.merge_range(0,0,0,9,"RESUMO POR HOSPITAL",fH)
-    cols6=["Regional","Hospital","Sigla","Valor Físico","Excesso 90d","% Excesso 90d",
-           f"Excesso {pol_dias}d",f"% Excesso {pol_dias}d","SKUs Total","SKUs Sem Consumo"]
-    for j,h in enumerate(cols6): ws6.write(1,j,h,fH2)
-    resumo=df.groupby(["HOSPITAL AJUSTADO","SIGLA","REGIONAL"]).agg(
-        VF=("VALOR TOTAL ","sum"),E90=("VEX_90","sum"),EALT=("VEX_ALT","sum"),
-        SKUS=("COD VALORES","count"),SEM=("CMM",lambda x:(x==0).sum())
-    ).reset_index().sort_values("E90",ascending=False)
-    for i,(_,r) in enumerate(resumo.iterrows()):
-        bg="#EBF3FB" if i%2==0 else "#FFFFFF"
-        p90 =r["E90"]/r["VF"]  if r["VF"] else 0
-        palt=r["EALT"]/r["VF"] if r["VF"] else 0
-        vals=[r["REGIONAL"],r["HOSPITAL AJUSTADO"],r["SIGLA"],r["VF"],r["E90"],p90,r["EALT"],palt,int(r["SKUS"]),int(r["SEM"])]
-        fmts=[bg_txt(bg),bg_txt(bg),bg_txt(bg),bg_brl(bg),bg_brl(bg),
-              bg_pct("#FADBD8" if p90>0.6 else bg),bg_brl(bg),
-              bg_pct("#FADBD8" if palt>0.6 else bg),
-              F(align="right",bg_color=bg,num_format="#,##0"),F(align="right",bg_color=bg,num_format="#,##0")]
-        write_row(ws6, 2+i, vals, fmts)
-    for i,w in enumerate([10,26,7,18,16,13,16,13,10,14]): ws6.set_column(i,i,w)
-    ws6.freeze_panes(2,0)
+# ── Gráficos (sem plotly — só matplotlib via st.bar_chart) ───────────
+def grafico_regional(df):
+    reg = df.groupby("REGIONAL").agg(
+        Físico=("VALOR TOTAL ","sum"),
+        Excesso_90d=("VEX_90","sum")
+    ).reset_index().sort_values("Excesso_90d",ascending=False)
+    reg = reg.set_index("REGIONAL")
+    st.bar_chart(reg[["Físico","Excesso_90d"]])
 
-    # ── Aba 7: Base completa ──────────────────────────────────────────
-    ws7=wb.add_worksheet("7. Base Completa")
-    cols_b=["HOSPITAL AJUSTADO","SIGLA","REGIONAL","COD VALORES","DESCRICAO","LINHA",
-            "CLF","CLF_ALT","ORIGEM_GRADE","FÍSICO","IDEAL_90","IDEAL_ALT",
-            "EXCESSO_90","EXCESSO_ALT","VALOR UNIT","VALOR TOTAL ","VEX_90","VEX_ALT",
-            "CMM","CMM_REDE","GRADE","STATUS GRADE","STATUS"]
-    hdrs_b=["Hospital","Sigla","Regional","Cód. Produto","Descrição","Linha",
-            "Classif. 90d",f"Classif. {pol_dias}d","Ideal da Grade?",
-            "Físico","Ideal 90d",f"Ideal {pol_dias}d","Excesso 90d",f"Excesso {pol_dias}d",
-            "Valor Unit.","Valor Total","Valor Exc. 90d",f"Valor Exc. {pol_dias}d",
-            "CMM Hosp.","CMM Rede","Grade","Status Grade","Status Consumo"]
-    for j,h in enumerate(hdrs_b): ws7.write(0,j,h,fH2)
-    df_b=df[cols_b].copy()
-    df_b["ORIGEM_GRADE"]=df_b["ORIGEM_GRADE"].map({True:"SIM",False:"NÃO"})
-    df_b=df_b.sort_values(["CLF","VEX_90"],ascending=[True,False])
-    num_set={"FÍSICO","IDEAL_90","IDEAL_ALT","EXCESSO_90","EXCESSO_ALT","CMM","CMM_REDE","GRADE"}
-    brl_set={"VALOR UNIT","VALOR TOTAL ","VEX_90","VEX_ALT"}
-    for i,(_,r) in enumerate(df_b.iterrows()):
-        bg=CORES.get(r["CLF"],"#FFFFFF")
-        for j,col in enumerate(cols_b):
-            v=r[col]
-            if col in brl_set:   ws7.write(1+i,j,v,bg_brl(bg))
-            elif col in num_set: ws7.write(1+i,j,v,bg_num(bg))
-            else:                ws7.write(1+i,j,v,bg_txt(bg))
-    for i,w in enumerate([22,7,10,16,38,16,26,26,12,10,10,10,10,10,12,14,14,14,10,10,8,16,18]):
-        ws7.set_column(i,i,w)
-    ws7.freeze_panes(1,0)
-
-    wb.close(); buf.seek(0)
-    return buf
+def grafico_hospital(df):
+    hosp = df.groupby("HOSPITAL AJUSTADO").agg(
+        Físico=("VALOR TOTAL ","sum"),
+        Excesso_90d=("VEX_90","sum")
+    ).reset_index().sort_values("Excesso_90d",ascending=False).head(20)
+    hosp = hosp.set_index("HOSPITAL AJUSTADO")
+    st.bar_chart(hosp[["Físico","Excesso_90d"]])
 
 # ── Interface ─────────────────────────────────────────────────────────
 st.title("📦 Equalização de Estoques")
-st.caption("Análise de redistribuição e retorno de estoques consignados")
 
 with st.sidebar:
     st.header("⚙️ Configurações")
-    pol_dias = st.selectbox("Política alternativa de cobertura", [120,150,180], index=1)
+    pol_dias = st.selectbox("Política alternativa", [120,150,180], index=1,
+                             help="90 dias é sempre calculado. Esta é a política adicional.")
     st.divider()
     st.markdown("**Legenda**")
     for clf,cor,desc in [
         ("Transferível","#D5F5E3","Excesso real"),
-        ("Transferível - Grade","#A9DFBF","Excesso de grade"),
-        ("Retorno CD","#FADBD8","Sem consumo na rede"),
-        ("Retorno CD - Grade","#F1948A","Sem consumo nem grade"),
+        ("Transf. - Grade","#A9DFBF","Excesso de grade"),
+        ("Retorno CD","#FADBD8","Sem consumo"),
+        ("Ret. CD - Grade","#F1948A","Sem consumo nem grade"),
         ("Adequado","#EBF3FB","Dentro do ideal"),
     ]:
         st.markdown(f'<span style="background:{cor};padding:2px 8px;border-radius:4px;font-size:.8rem">{clf}</span> {desc}',unsafe_allow_html=True)
 
-st.subheader("1. Base de estoques (.xlsb)")
-file_base = st.file_uploader("Upload do arquivo de estudo", type=["xlsb"])
+st.subheader("1. Upload da base")
+file_base = st.file_uploader("Arquivo de estudo (.xlsb)", type=["xlsb"])
 
 if file_base:
     fb = file_base.read()
     with st.spinner("Lendo arquivo..."):
         sheets = get_sheets(fb)
-
     if "BASE_ESTUDOS" not in sheets:
         st.error(f"Aba BASE_ESTUDOS não encontrada. Abas: {sheets}"); st.stop()
-
     with st.spinner("Carregando dados..."):
         df_raw = read_sheet(fb, "BASE_ESTUDOS")
 
     c1,c2 = st.columns([2,1])
     with c1:
-        linhas_disp = sorted(df_raw["LINHA"].dropna().unique())
+        linhas_disp = sorted(df_raw["LINHA"].dropna().astype(str).unique())
         linhas_sel  = st.multiselect("Linhas de produto", linhas_disp,
                       default=["HEMODINAMICA"] if "HEMODINAMICA" in linhas_disp else linhas_disp[:1])
     with c2:
-        regs_disp = sorted(df_raw["REGIONAL"].dropna().unique())
+        regs_disp = sorted(df_raw["REGIONAL"].dropna().astype(str).unique())
         regs_sel  = st.multiselect("Regionais (opcional)", regs_disp)
 
-    if not linhas_sel:
-        st.warning("Selecione ao menos uma linha."); st.stop()
-
+    if not linhas_sel: st.warning("Selecione ao menos uma linha."); st.stop()
     df_filtrado = df_raw if not regs_sel else df_raw[df_raw["REGIONAL"].isin(regs_sel)]
 
-    st.subheader("2. Base de lotes e validades (opcional)")
-    file_lotes = st.file_uploader("Upload de lotes (.xlsx ou .csv)", type=["xlsx","csv"])
-    df_lotes   = None
-    usar_cmv2  = False
+    st.subheader("2. Base de lotes (opcional)")
+    file_lotes = st.file_uploader("Lotes e validades (.xlsx ou .csv)", type=["xlsx","csv"])
+    df_lotes = None
     if file_lotes is None and "CMV_2" in sheets:
-        usar_cmv2 = st.checkbox("Usar aba CMV_2 do próprio arquivo", value=True)
+        if st.checkbox("Usar aba CMV_2 do próprio arquivo", value=True):
+            file_lotes = "cmv2"
 
     if st.button("▶ Rodar análise", type="primary", use_container_width=True):
         with st.spinner("Processando..."):
             df = processar(df_filtrado, linhas_sel, pol_dias)
-            if file_lotes:
+            if file_lotes == "cmv2":
+                df_lotes = processar_lotes(read_sheet(fb,"CMV_2"), df)
+            elif file_lotes:
                 rl = pd.read_csv(file_lotes) if file_lotes.name.endswith(".csv") else pd.read_excel(file_lotes)
                 df_lotes = processar_lotes(rl, df)
-            elif usar_cmv2:
-                df_lotes = processar_lotes(read_sheet(fb,"CMV_2"), df)
+        st.session_state["df"]       = df
+        st.session_state["df_lotes"] = df_lotes
+        st.session_state["pol_dias"] = pol_dias
 
-        st.divider()
-        c1,c2,c3,c4 = st.columns(4)
-        c1.metric("Valor físico",     f"R$ {df['VALOR TOTAL '].sum():,.0f}")
-        c2.metric("Excesso 90d",      f"R$ {df['VEX_90'].sum():,.0f}")
-        c3.metric("Transferível 90d", f"R$ {df[df['CLF'].str.startswith('TRANSFERIVEL')]['VEX_90'].sum():,.0f}")
-        c4.metric("Retorno ao CD",    f"R$ {df[df['CLF'].str.startswith('RETORNO_CD')]['VEX_90'].sum():,.0f}")
+if "df" in st.session_state:
+    df       = st.session_state["df"]
+    df_lotes = st.session_state["df_lotes"]
+    pol_dias = st.session_state["pol_dias"]
 
-        if df_lotes is not None:
-            c5,c6,_,_ = st.columns(4)
-            c5.metric("Lotes em risco", int(df_lotes[df_lotes["STATUS_VEN"]=="VENCE ANTES DE CONSUMIR"].shape[0]))
-            c6.metric("SKUs em risco",  int(df_lotes[df_lotes["STATUS_VEN"]=="VENCE ANTES DE CONSUMIR"]["COD_STR"].nunique()))
+    st.divider()
 
-        st.dataframe(df["CLF"].value_counts().reset_index().rename(
-            columns={"CLF":"Classificação 90d","count":"Qtd. itens"}),
-            use_container_width=True, hide_index=True)
+    # ── KPIs ──────────────────────────────────────────────────────────
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("💰 Valor físico",      f"R$ {df['VALOR TOTAL '].sum():,.0f}")
+    c2.metric("📉 Excesso 90d",       f"R$ {df['VEX_90'].sum():,.0f}",
+              delta=f"-R$ {df['VEX_90'].sum() - df['VEX_ALT'].sum():,.0f} em {pol_dias}d",
+              delta_color="inverse")
+    c3.metric("🔀 Transferível 90d",  f"R$ {df[df['CLF'].str.startswith('TRANSFERIVEL')]['VEX_90'].sum():,.0f}")
+    c4.metric("🏭 Retorno ao CD",     f"R$ {df[df['CLF'].str.startswith('RETORNO_CD')]['VEX_90'].sum():,.0f}")
 
-        st.divider()
+    if df_lotes is not None:
+        c5,c6,_,_ = st.columns(4)
+        n_risco = df_lotes[df_lotes["STATUS_VEN"]=="Vence antes de consumir"].shape[0]
+        s_risco = df_lotes[df_lotes["STATUS_VEN"]=="Vence antes de consumir"]["COD_STR"].nunique()
+        c5.metric("⚠️ Lotes em risco", f"{n_risco:,}")
+        c6.metric("🧬 SKUs em risco",  f"{s_risco:,}")
+
+    st.divider()
+
+    # ── Abas de análise ───────────────────────────────────────────────
+    tabs = ["📊 Por Regional", "🏥 Por Hospital", "🔀 Transferências", "🏭 Retorno ao CD"]
+    if df_lotes is not None: tabs.append("⚠️ Risco de Vencimento")
+    tabs.append("⬇️ Download Excel")
+
+    tab_list = st.tabs(tabs)
+    t_reg, t_hosp, t_transf, t_ret = tab_list[0], tab_list[1], tab_list[2], tab_list[3]
+    t_ven  = tab_list[4] if df_lotes is not None else None
+    t_dl   = tab_list[-1]
+
+    # ── Por Regional ──────────────────────────────────────────────────
+    with t_reg:
+        st.markdown("#### Excesso por regional")
+        reg = df.groupby("REGIONAL").agg(
+            Físico=("VALOR TOTAL ","sum"),
+            Excesso_90d=("VEX_90","sum"),
+            Excesso_alt=("VEX_ALT","sum"),
+            Hospitais=("HOSPITAL AJUSTADO","nunique"),
+            SKUs=("COD VALORES","count"),
+        ).reset_index().sort_values("Excesso_90d",ascending=False)
+        reg["%_Excesso"] = (reg["Excesso_90d"]/reg["Físico"]*100).round(1)
+
+        st.bar_chart(reg.set_index("REGIONAL")[["Físico","Excesso_90d"]])
+
+        reg_disp = reg.copy()
+        reg_disp["Físico"]       = reg_disp["Físico"].apply(lambda x: f"R$ {x:,.0f}")
+        reg_disp["Excesso_90d"]  = reg_disp["Excesso_90d"].apply(lambda x: f"R$ {x:,.0f}")
+        reg_disp["Excesso_alt"]  = reg_disp["Excesso_alt"].apply(lambda x: f"R$ {x:,.0f}")
+        reg_disp["%_Excesso"]    = reg_disp["%_Excesso"].apply(lambda x: f"{x:.1f}%")
+        reg_disp.columns = ["Regional","Valor Físico","Excesso 90d",f"Excesso {pol_dias}d","Hospitais","SKUs","% Excesso"]
+        st.dataframe(reg_disp, use_container_width=True, hide_index=True)
+
+        # Classificação
+        st.markdown("#### Distribuição por classificação")
+        clf_counts = df["CLF"].value_counts().reset_index()
+        clf_counts.columns=["Classificação","Itens"]
+        st.dataframe(clf_counts, use_container_width=True, hide_index=True)
+
+    # ── Por Hospital ──────────────────────────────────────────────────
+    with t_hosp:
+        st.markdown("#### Top 20 hospitais por excesso (90d)")
+        hosp = df.groupby(["HOSPITAL AJUSTADO","SIGLA","REGIONAL"]).agg(
+            Físico=("VALOR TOTAL ","sum"),
+            Excesso_90d=("VEX_90","sum"),
+            Excesso_alt=("VEX_ALT","sum"),
+            SKUs=("COD VALORES","count"),
+            Sem_consumo=("CMM",lambda x:(x==0).sum()),
+        ).reset_index().sort_values("Excesso_90d",ascending=False)
+        hosp["%_Excesso"] = (hosp["Excesso_90d"]/hosp["Físico"]*100).round(1)
+
+        st.bar_chart(hosp.head(20).set_index("HOSPITAL AJUSTADO")[["Físico","Excesso_90d"]])
+
+        hosp_disp = hosp.copy()
+        hosp_disp["Físico"]      = hosp_disp["Físico"].apply(lambda x: f"R$ {x:,.0f}")
+        hosp_disp["Excesso_90d"] = hosp_disp["Excesso_90d"].apply(lambda x: f"R$ {x:,.0f}")
+        hosp_disp["Excesso_alt"] = hosp_disp["Excesso_alt"].apply(lambda x: f"R$ {x:,.0f}")
+        hosp_disp["%_Excesso"]   = hosp_disp["%_Excesso"].apply(lambda x: f"{x:.1f}%")
+        hosp_disp.columns = ["Hospital","Sigla","Regional","Valor Físico","Excesso 90d",
+                              f"Excesso {pol_dias}d","SKUs","Sem Consumo","% Excesso"]
+        st.dataframe(hosp_disp, use_container_width=True, hide_index=True)
+
+    # ── Transferências ────────────────────────────────────────────────
+    with t_transf:
+        st.markdown("#### Itens para redistribuição entre hospitais")
+
+        col_f1, col_f2 = st.columns(2)
+        with col_f1:
+            regs_t = ["Todas"] + sorted(df["REGIONAL"].unique().tolist())
+            reg_f  = st.selectbox("Filtrar regional", regs_t, key="reg_transf")
+        with col_f2:
+            tipo_f = st.selectbox("Tipo de excesso", ["Todos","Consumo real","Excesso de grade"], key="tipo_transf")
+
+        transf = df[df["CLF"].str.startswith("TRANSFERIVEL")].copy()
+        if reg_f  != "Todas":         transf = transf[transf["REGIONAL"]==reg_f]
+        if tipo_f == "Consumo real":  transf = transf[transf["CLF"]=="TRANSFERIVEL"]
+        if tipo_f == "Excesso de grade": transf = transf[transf["CLF"]=="TRANSFERIVEL - GRADE"]
+
+        transf_disp = transf[["REGIONAL","HOSPITAL AJUSTADO","SIGLA","COD VALORES","DESCRICAO",
+                               "CLF","FÍSICO","IDEAL_90","EXCESSO_90","VALOR UNIT","VEX_90"]].copy()
+        transf_disp.columns = ["Regional","Hospital","Sigla","Código","Descrição",
+                                "Classificação","Físico","Ideal 90d","Excesso 90d","Valor Unit.","Valor Excesso"]
+        transf_disp = transf_disp.sort_values("Valor Excesso",ascending=False)
+
+        st.caption(f"{len(transf_disp):,} itens  |  R$ {transf_disp['Valor Excesso'].sum():,.0f} em excesso")
+        st.dataframe(
+            transf_disp.style.format({
+                "Físico":"#,##0.00","Ideal 90d":"{:.2f}","Excesso 90d":"{:.2f}",
+                "Valor Unit.":"R$ {:,.2f}","Valor Excesso":"R$ {:,.2f}"
+            }),
+            use_container_width=True, hide_index=True, height=500
+        )
+
+    # ── Retorno ao CD ─────────────────────────────────────────────────
+    with t_ret:
+        st.markdown("#### Itens para retorno ao CD")
+
+        col_f3, col_f4 = st.columns(2)
+        with col_f3:
+            regs_r = ["Todas"] + sorted(df["REGIONAL"].unique().tolist())
+            reg_r  = st.selectbox("Filtrar regional", regs_r, key="reg_ret")
+        with col_f4:
+            tipo_r = st.selectbox("Tipo", ["Todos","Sem consumo","Grade sem consumo"], key="tipo_ret")
+
+        ret = df[df["CLF"].str.startswith("RETORNO_CD")].copy()
+        if reg_r != "Todas":             ret = ret[ret["REGIONAL"]==reg_r]
+        if tipo_r == "Sem consumo":      ret = ret[ret["CLF"]=="RETORNO_CD"]
+        if tipo_r == "Grade sem consumo":ret = ret[ret["CLF"]=="RETORNO_CD - GRADE"]
+
+        ret_disp = ret[["REGIONAL","HOSPITAL AJUSTADO","SIGLA","COD VALORES","DESCRICAO",
+                         "CLF","FÍSICO","IDEAL_90","EXCESSO_90","CMM_REDE","VALOR UNIT","VEX_90"]].copy()
+        ret_disp.columns = ["Regional","Hospital","Sigla","Código","Descrição",
+                             "Classificação","Físico","Ideal 90d","Excesso 90d","CMM Rede","Valor Unit.","Valor a Retornar"]
+        ret_disp = ret_disp.sort_values("Valor a Retornar",ascending=False)
+
+        st.caption(f"{len(ret_disp):,} itens  |  R$ {ret_disp['Valor a Retornar'].sum():,.0f} a retornar")
+        st.dataframe(
+            ret_disp.style.format({
+                "Físico":"{:.2f}","Ideal 90d":"{:.2f}","Excesso 90d":"{:.2f}",
+                "CMM Rede":"{:.2f}","Valor Unit.":"R$ {:,.2f}","Valor a Retornar":"R$ {:,.2f}"
+            }),
+            use_container_width=True, hide_index=True, height=500
+        )
+
+    # ── Risco de Vencimento ───────────────────────────────────────────
+    if t_ven is not None:
+        with t_ven:
+            st.markdown("#### Lotes com risco de vencer antes de ser consumidos")
+
+            status_opts = ["Todos com risco","Vence antes de consumir","Margem apertada","Sem consumo"]
+            status_f = st.selectbox("Filtrar status", status_opts, key="status_ven")
+
+            ven = df_lotes[~df_lotes["STATUS_VEN"].str.startswith("OK")].copy()
+            if status_f == "Vence antes de consumir": ven = ven[ven["STATUS_VEN"]=="Vence antes de consumir"]
+            elif status_f == "Margem apertada":        ven = ven[ven["STATUS_VEN"]=="Margem apertada"]
+            elif status_f == "Sem consumo":            ven = ven[ven["STATUS_VEN"].str.startswith("Sem consumo")]
+
+            # Resumo rápido
+            ca,cb,cc = st.columns(3)
+            ca.metric("Lotes em risco", ven[ven["STATUS_VEN"]=="Vence antes de consumir"].shape[0])
+            cb.metric("Margem apertada",ven[ven["STATUS_VEN"]=="Margem apertada"].shape[0])
+            cc.metric("Sem consumo",    ven[ven["STATUS_VEN"].str.startswith("Sem consumo")].shape[0])
+
+            cols_ven = ["COD_STR","DESCRICAO","VALIDADE_DT","MAV","QUANTIDADE","CMM_REDE","MPC","SALDO","STATUS_VEN"]
+            ven_cols_existentes = [c for c in cols_ven if c in ven.columns]
+            ven_disp = ven[ven_cols_existentes].copy()
+            ven_disp = ven_disp.rename(columns={
+                "COD_STR":"Código","DESCRICAO":"Descrição","VALIDADE_DT":"Validade",
+                "MAV":"Meses até Vencer","QUANTIDADE":"Qtd. Lote","CMM_REDE":"CMM Rede",
+                "MPC":"Meses p/ Consumir","SALDO":"Saldo (meses)","STATUS_VEN":"Status"
+            })
+            ven_disp = ven_disp.sort_values(["Status","Meses até Vencer"])
+            ven_disp["MPC_disp"] = ven_disp.get("Meses p/ Consumir","").apply(
+                lambda x: "∞" if (isinstance(x,float) and np.isinf(x)) else f"{x:.1f}" if isinstance(x,(int,float)) else x)
+
+            st.dataframe(ven_disp, use_container_width=True, hide_index=True, height=500)
+
+    # ── Download ──────────────────────────────────────────────────────
+    with t_dl:
+        st.markdown("#### Download completo em Excel")
+        st.markdown("O arquivo contém todas as análises com formatação de cores e filtros.")
         buf  = make_excel(df, df_lotes, pol_dias)
-        nome = f"Equalizacao_{'_'.join(linhas_sel)}_{date.today().strftime('%Y%m%d')}.xlsx"
-        st.download_button("⬇️ Baixar Excel completo", data=buf, file_name=nome,
+        nome = f"Equalizacao_{'_'.join(linhas_sel if 'linhas_sel' in dir() else ['base'])}_{date.today().strftime('%Y%m%d')}.xlsx"
+        st.download_button("⬇️ Baixar Excel", data=buf, file_name=nome,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True, type="primary")
